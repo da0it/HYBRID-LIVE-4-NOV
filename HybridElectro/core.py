@@ -46,9 +46,9 @@ def validate_target(target, label, global_target=False):
                 if (len(parts) != 2 or parts[0] != "@return"
                         or not parts[1].isdigit() or int(parts[1]) < 1):
                     raise ConfigurationError(label + ": use @master or @return:1, @return:2, ...")
-    kinds = [key for key in ("mixer", "send", "device") if key in target]
+    kinds = [key for key in ("mixer", "send", "device", "rack") if key in target]
     if len(kinds) != 1:
-        raise ConfigurationError(label + ": choose exactly one of mixer, send, device")
+        raise ConfigurationError(label + ": choose exactly one of mixer, send, device, rack")
     kind = kinds[0]
     allowed = {"track", kind}
     if kind == "mixer":
@@ -56,10 +56,18 @@ def validate_target(target, label, global_target=False):
             raise ConfigurationError(label + ": unknown mixer parameter")
     elif kind == "send":
         _integer(target[kind], 1, 128, label + ".send")
+    elif kind == "rack":
+        _name(target["rack"], label + ".rack")
+        _integer(target.get("macro"), 1, 16, label + ".macro")
+        allowed.add("macro")
     else:
         _name(target["device"], label + ".device")
         _name(target.get("parameter"), label + ".parameter")
         allowed.add("parameter")
+        if "device_scope" in target:
+            if target["device_scope"] != "top_level":
+                raise ConfigurationError(label + ": device_scope must be top_level")
+            allowed.add("device_scope")
     unknown = set(target) - allowed
     if unknown:
         raise ConfigurationError(label + ": unknown fields " + ", ".join(sorted(unknown)))
@@ -100,6 +108,11 @@ def validate_config(config):
     tracks = config.get("tracks")
     if not isinstance(tracks, dict):
         raise ConfigurationError("tracks must be an object")
+    macros = config.get("track_macros")
+    if macros is not None:
+        if not isinstance(macros, dict) or set(macros) != {"rack_name"}:
+            raise ConfigurationError("track_macros must contain only rack_name")
+        _name(macros["rack_name"], "track_macros.rack_name")
     for name, targets in tracks.items():
         _name(name, "track name")
         if not isinstance(targets, list) or len(targets) != 8:
@@ -111,16 +124,37 @@ def validate_config(config):
         raise ConfigurationError("global needs eight targets (null = unused)")
     for i, target in enumerate(targets):
         validate_target(target, "global knob {}".format(i + 1), global_target=True)
+    volumes = config.get("volume_follow_session")
+    if volumes is not None:
+        if (not isinstance(volumes, dict) or "surface" not in volumes
+                or set(volumes) - {"surface", "max_db"}):
+            raise ConfigurationError("volume_follow_session needs surface and optional max_db")
+        _name(volumes["surface"], "volume_follow_session.surface")
+        if encoders.get("global") is None:
+            raise ConfigurationError("volume_follow_session requires encoders.global")
+        if "max_db" in volumes:
+            if type(volumes["max_db"]) not in (int, float) or volumes["max_db"] != 0:
+                raise ConfigurationError("volume_follow_session.max_db must be 0")
+            if encoders["global"]["mode"] != "absolute":
+                raise ConfigurationError("The 0 dB volume range requires absolute encoders")
     pads = config.get("pads", [])
     if not isinstance(pads, list):
         raise ConfigurationError("pads must be a list")
+    follow = config.get("pad_follow_session")
+    if follow is not None:
+        if not isinstance(follow, dict) or set(follow) != {"surface"}:
+            raise ConfigurationError("pad_follow_session must contain only surface")
+        _name(follow["surface"], "pad_follow_session.surface")
     pad_messages = set()
     for pad in pads:
         if not isinstance(pad, dict):
             raise ConfigurationError("pad must be an object")
         _integer(pad.get("channel"), 1, 16, "pad.channel")
         _integer(pad.get("note"), 0, 127, "pad.note")
-        _name(pad.get("track"), "pad.track")
+        if follow:
+            _integer(pad.get("track_slot"), 1, 8, "pad.track_slot")
+        else:
+            _name(pad.get("track"), "pad.track")
         key = (pad["channel"], pad["note"])
         if key in pad_messages:
             raise ConfigurationError("Duplicate pad MIDI channel/note: {}".format(key))
@@ -162,6 +196,23 @@ def resolve_track(song, selector):
                  if track.name == selector), "track " + selector)
 
 
+def resolve_session_track(surfaces, surface_name, slot):
+    """Read the same SessionComponent that draws the source controller's ring."""
+    source = _one((s for s in surfaces if
+                   surface_name in (type(s).__name__, type(s).__module__.split(".")[0])),
+                  "control surface " + surface_name)
+    session = getattr(source, "_highlighting_session_component", None)
+    if session is None:
+        raise TargetError(surface_name + " has no active session ring")
+    if not 1 <= slot <= session.width():
+        raise TargetError("Pad is outside the session ring")
+    tracks = tuple(session.tracks_to_use())
+    index = session.track_offset() + slot - 1
+    if not 0 <= index < len(tracks):
+        raise TargetError("No track at this pad in the session ring")
+    return tracks[index]
+
+
 def walk_devices(container, prefix=()):
     """Include all Rack chains, even when a chain is not selected in the UI."""
     for device in getattr(container, "devices", ()):
@@ -169,6 +220,18 @@ def walk_devices(container, prefix=()):
         yield path, device
         for chain in getattr(device, "chains", ()):
             yield from walk_devices(chain, path + (chain.name,))
+
+
+def track_targets(config, selected_track):
+    """Follow any selected track, including tracks created after initialization."""
+    if selected_track is None:
+        return [None] * 8
+    if selected_track.name in config["tracks"]:
+        return config["tracks"][selected_track.name]
+    macros = config.get("track_macros")
+    if macros:
+        return [{"rack": macros["rack_name"], "macro": i + 1} for i in range(8)]
+    return [None] * 8
 
 
 def resolve_target(song, selected_track, target):
@@ -187,9 +250,19 @@ def resolve_target(song, selected_track, target):
         if index >= len(sends):
             raise TargetError("Not found: {} / send {}".format(track.name, index + 1))
         parameter = sends[index]
+    elif "rack" in target:
+        rack = _one((d for _, d in walk_devices(track) if d.name == target["rack"]),
+                    "{} / Rack {}".format(track.name, target["rack"]))
+        if not getattr(rack, "can_have_chains", False):
+            raise TargetError("{} is not a Rack".format(target["rack"]))
+        original = "Macro {}".format(target["macro"])
+        parameter = _one((p for p in rack.parameters
+                          if getattr(p, "original_name", p.name) == original),
+                         "{} / {} / {}".format(track.name, rack.name, original))
     else:
-        device = _one((device for _, device in walk_devices(track)
-                       if device.name == target["device"]),
+        devices = (track.devices if target.get("device_scope") == "top_level"
+                   else (device for _, device in walk_devices(track)))
+        device = _one((device for device in devices if device.name == target["device"]),
                       "{} / device {}".format(track.name, target["device"]))
         name = target["parameter"]
         parameter = _one((p for p in device.parameters

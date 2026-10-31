@@ -5,37 +5,125 @@ import sys
 import tempfile
 import types
 import unittest
+import xml.etree.ElementTree as ET
 from contextlib import nullcontext
 from pathlib import Path
 from unittest.mock import patch
 
 from HybridElectro.core import (
     ConfigurationError, TargetError, load_config, resolve_target,
-    resolve_track, validate_config,
+    resolve_track, validate_config, track_targets, resolve_session_track,
 )
 from tools.install import install
 from tools.midi_log import summary
+from tools.prepare_set import clean_midi_mappings
+from HybridElectro.volume import UnityVolumeBinding
 
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 def config():
-    return load_config(ROOT / "HybridElectro" / "config.json")
+    result = load_config(ROOT / "HybridElectro" / "config.json")
+    result.pop("track_macros", None)
+    result.pop("pad_follow_session", None)
+    result.pop("volume_follow_session", None)
+    result["pads"] = [{"channel": 1, "note": 64, "track": "DECK A"},
+                      {"channel": 1, "note": 65, "track": "BREAKS"}]
+    result["tracks"] = {"DECK A": [{"mixer": "volume"}] + [None] * 7,
+                        "BREAKS": [{"mixer": "volume"}] + [None] * 7}
+    result["setup_mode"] = True
+    return result
 
 
 class Parameter:
     def __init__(self, name, original_name=None):
         self.name = name
         self.original_name = original_name or name
+        self._value = 0.5
 
     @property
     def value(self):
-        return 0.5
+        return self._value
 
     @value.setter
     def value(self, value):
         raise AssertionError("Track selection or parameter binding wrote a value")
+
+
+class VolumeParameter(Parameter):
+    min, max, default_value, is_enabled = 0.0, 1.0, 0.85, True
+
+    def __init__(self, value=0.5):
+        super().__init__("Volume")
+        self._value = value
+        self.writes = []
+
+    def str_for_value(self, value):
+        return "0.0 dB" if value == self.default_value else "+6.0 dB"
+
+    @Parameter.value.setter
+    def value(self, value):
+        self.writes.append(value)
+        self._value = value
+
+
+class VolumeTests(unittest.TestCase):
+    def test_full_midi_sweep_never_exceeds_zero_db_and_reaches_both_endpoints(self):
+        p = VolumeParameter()
+        binding = UnityVolumeBinding()
+        binding.bind(p)
+        self.assertEqual(p.writes, [])
+        for value in range(128):
+            binding.receive(value)
+        self.assertEqual(p.value, p.default_value)
+        for value in reversed(range(128)):
+            binding.receive(value)
+        self.assertEqual(p.value, p.min)
+        self.assertTrue(all(p.min <= value <= p.default_value for value in p.writes))
+
+    def test_pickup_on_rebind_and_mouse_edits_preserves_existing_values(self):
+        a, b = VolumeParameter(0.425), VolumeParameter(0.7)
+        binding = UnityVolumeBinding()
+        binding.bind(a)
+        binding.receive(10)
+        binding.receive(60)
+        self.assertEqual(a.writes, [])
+        binding.receive(64)
+        self.assertTrue(a.writes)
+        binding.bind(b)
+        binding.receive(64)
+        self.assertEqual(b.writes, [])
+        binding.receive(110)
+        self.assertTrue(b.writes)
+        b._value = 0.2  # independent mouse/automation edit
+        count = len(b.writes)
+        binding.receive(111)
+        self.assertEqual(len(b.writes), count)
+        binding.bind(None)
+        binding.receive(127)
+        self.assertEqual(len(b.writes), count)
+
+    def test_binding_does_not_clamp_existing_boost_but_input_can_reach_zero(self):
+        p = VolumeParameter(1.0)
+        binding = UnityVolumeBinding()
+        binding.bind(p)
+        self.assertEqual(p.value, 1.0)
+        self.assertEqual(p.writes, [])
+        binding.receive(127)
+        self.assertEqual(p.value, 0.85)
+        p.is_enabled = False
+        binding.receive(0)
+        self.assertEqual(p.value, 0.85)
+
+    def test_unverified_endpoint_fails_closed(self):
+        binding = UnityVolumeBinding()
+        p = VolumeParameter()
+        p.str_for_value = lambda value: "-6.0 dB"
+        with self.assertRaises(TargetError):
+            binding.bind(p)
+        binding.receive(127)
+        self.assertEqual(p.writes, [])
 
 
 def device(name, parameters=(), chains=()):
@@ -49,6 +137,13 @@ def track(name, devices=()):
                                             sends=[Parameter("A"), Parameter("B")]))
 
 
+def rack(name="PERFORM"):
+    result = device(name, [Parameter("Device On")] +
+                    [Parameter("Effect {}".format(i), "Macro {}".format(i)) for i in range(1, 17)])
+    result.can_have_chains = True
+    return result
+
+
 def song():
     deck = track("DECK A", [device("Auto Filter", [Parameter("Frequency")])])
     breaks = track("BREAKS", [device("Beat Repeat", [Parameter("Grid")])])
@@ -59,8 +154,97 @@ def song():
 
 
 class CoreTests(unittest.TestCase):
-    def test_shipped_configuration_starts_in_setup_mode(self):
-        self.assertTrue(config()["setup_mode"])
+    def test_capped_volume_configuration_rejects_wrong_limit_and_relative_mode(self):
+        for limit in (-6, 6, True, "0", float("nan")):
+            c = config()
+            c["volume_follow_session"] = {"surface": "Launchpad", "max_db": limit}
+            with self.assertRaises(ConfigurationError):
+                validate_config(c)
+        c = config()
+        c["volume_follow_session"] = {"surface": "Launchpad", "max_db": 0}
+        c["encoders"]["global"]["mode"] = "relative_two_complement"
+        with self.assertRaises(ConfigurationError):
+            validate_config(c)
+
+    def test_volume_follow_configuration_rejects_invalid_source_or_missing_bank(self):
+        for value in ({}, {"surface": ""}, {"surface": "Launchpad", "extra": True}):
+            c = config()
+            c["volume_follow_session"] = value
+            with self.assertRaises(ConfigurationError):
+                validate_config(c)
+        c = config()
+        c["volume_follow_session"] = {"surface": "Launchpad"}
+        c["encoders"]["global"] = None
+        with self.assertRaises(ConfigurationError):
+            validate_config(c)
+    def test_session_pads_follow_offset_and_visible_track_order(self):
+        tracks = [track("Track {}".format(i)) for i in range(15)]
+        ring = types.SimpleNamespace(width=lambda:8, track_offset=lambda:0,
+                                     tracks_to_use=lambda:tracks)
+        launchpad = type("Launchpad", (), {})()
+        launchpad._highlighting_session_component = ring
+        self.assertIs(resolve_session_track([launchpad], "Launchpad", 1), tracks[0])
+        ring.track_offset = lambda:1
+        self.assertIs(resolve_session_track([launchpad], "Launchpad", 1), tracks[1])
+        self.assertIs(resolve_session_track([launchpad], "Launchpad", 8), tracks[8])
+        ring.track_offset = lambda:8
+        self.assertIs(resolve_session_track([launchpad], "Launchpad", 1), tracks[8])
+        with self.assertRaises(TargetError):
+            resolve_session_track([launchpad], "Launchpad", 8)
+        del tracks[0]  # folding/removing tracks changes the controller's visible list
+        self.assertIs(resolve_session_track([launchpad], "Launchpad", 1), tracks[8])
+
+    def test_missing_or_ambiguous_launchpad_fails_closed(self):
+        with self.assertRaises(TargetError):
+            resolve_session_track([], "Launchpad", 1)
+        a, b = type("Launchpad", (), {})(), type("Launchpad", (), {})()
+        with self.assertRaises(TargetError):
+            resolve_session_track([a,b], "Launchpad", 1)
+        a._highlighting_session_component = None
+        with self.assertRaises(TargetError):
+            resolve_session_track([a], "Launchpad", 1)
+
+    def test_legacy_configuration_without_macros_is_supported(self):
+        legacy = config()
+        self.assertNotIn("track_macros", legacy)
+        self.assertEqual(track_targets(legacy, track("UNKNOWN")), [None] * 8)
+        validate_config(legacy)
+
+    def test_macro_names_survive_user_renaming(self):
+        s = song()
+        r = rack()
+        s.tracks[0].devices.append(r)
+        self.assertIs(resolve_target(s, s.tracks[0], {"rack": "PERFORM", "macro": 3}),
+                      r.parameters[3])
+        r.parameters[3].name = "My delay feedback"
+        self.assertIs(resolve_target(s, s.tracks[0], {"rack": "PERFORM", "macro": 3}),
+                      r.parameters[3])
+
+    def test_perform_must_be_a_unique_rack(self):
+        s = song()
+        target = {"rack": "PERFORM", "macro": 1}
+        s.tracks[0].devices = [device("PERFORM", [Parameter("Macro 1")])]
+        with self.assertRaisesRegex(TargetError, "not a Rack"):
+            resolve_target(s, s.tracks[0], target)
+        s.tracks[0].devices = [rack(), rack()]
+        with self.assertRaisesRegex(TargetError, "Ambiguous"):
+            resolve_target(s, s.tracks[0], target)
+
+    def test_global_filter_ignores_another_filter_inside_perform(self):
+        s = song()
+        t = s.tracks[0]
+        expected = t.devices[0].parameters[0]
+        chain = types.SimpleNamespace(name="FX", devices=[device("Auto Filter", [Parameter("Frequency")])])
+        t.devices.append(device("PERFORM", chains=[chain]))
+        target = {"device": "Auto Filter", "parameter": "Frequency", "device_scope": "top_level"}
+        self.assertIs(resolve_target(s, t, target), expected)
+
+    def test_macro_indices_out_of_range_fail_validation(self):
+        for number in (0, 17, True):
+            c = config()
+            c["tracks"]["DECK A"][0] = {"rack": "PERFORM", "macro": number}
+            with self.assertRaises(ConfigurationError):
+                validate_config(c)
 
     def test_conflicting_banks_are_rejected_but_same_cc_on_different_channel_is_allowed(self):
         c = config()
@@ -195,6 +379,9 @@ class FakeEncoder:
     def set_needs_takeover(self, enabled):
         self.takeover = enabled
 
+    def add_value_listener(self, listener):
+        self.listener = listener
+
     def release_parameter(self):
         self.parameter = None
 
@@ -212,6 +399,67 @@ class FakeButton:
 
 
 class SurfaceTests(unittest.TestCase):
+    def test_capped_volume_input_resolves_ring_before_writing_and_never_native_maps(self):
+        self.config["encoders"]["global"]["mode"] = "absolute"
+        self.config["volume_follow_session"] = {"surface": "Launchpad", "max_db": 0}
+        for t in self.song.tracks:
+            t.mixer_device.volume = VolumeParameter(0.85)
+        offset = [0]
+        launchpad = type("Launchpad", (), {})()
+        launchpad._highlighting_session_component = types.SimpleNamespace(
+            width=lambda: 8, track_offset=lambda: offset[0], tracks_to_use=lambda: self.song.tracks)
+        with patch.object(self.surface, "get_control_surfaces", return_value=[launchpad]):
+            surface = self.make_surface()
+            knobs = surface._knob_banks["global"]
+            self.assertTrue(all(k.parameter is None for k in knobs))
+            first, second = (t.mixer_device.volume for t in self.song.tracks)
+            self.assertEqual(first.writes, [])
+            self.assertEqual(second.writes, [])
+            offset[0] = 1  # input arrives before the next display tick
+            knobs[0].listener(127)
+            self.assertEqual(first.writes, [])
+            self.assertEqual(second.writes, [0.85])
+            knobs[0].listener(126)
+            self.assertLess(second.value, 0.85)
+            offset[0] = 2  # no tracks left: release the old target
+            knobs[0].listener(127)
+            self.assertEqual(len(second.writes), 2)
+
+    def test_volumes_follow_ring_without_selection_or_value_changes(self):
+        self.config["volume_follow_session"] = {"surface": "Launchpad"}
+        self.song.tracks.extend(track("Extra {}".format(i)) for i in range(10))
+        tracks = self.song.tracks
+        launchpad = type("Launchpad", (), {})()
+        offset = [0]
+        visible = list(tracks)
+        launchpad._highlighting_session_component = types.SimpleNamespace(
+            width=lambda: 8, track_offset=lambda: offset[0], tracks_to_use=lambda: visible)
+        values = [t.mixer_device.volume.value for t in tracks]
+        with patch.object(self.surface, "get_control_surfaces", return_value=[launchpad]):
+            surface = self.make_surface()
+            knobs = surface._knob_banks["global"]
+            track_knob = surface._knob_banks["track"][0].parameter
+            self.assertEqual([k.parameter for k in knobs], [t.mixer_device.volume for t in visible[:8]])
+            offset[0] = 1
+            surface.update_display()
+            self.assertEqual([k.parameter for k in knobs], [t.mixer_device.volume for t in visible[1:9]])
+            del visible[2]  # folded/removed track follows Launchpad's actual list
+            surface.update_display()
+            self.assertEqual([k.parameter for k in knobs], [t.mixer_device.volume for t in visible[1:9]])
+            offset[0] = 8
+            surface.update_display()
+            self.assertEqual([k.parameter for k in knobs],
+                             [t.mixer_device.volume for t in visible[8:]] + [None] * 5)
+            self.assertIs(surface._knob_banks["track"][0].parameter, track_knob)
+            self.assertIs(self.song.view.selected_track, tracks[0])
+            before = [k.connections for k in knobs]
+            surface.update_display()
+            self.assertEqual([k.connections for k in knobs], before)
+        with patch.object(self.surface, "get_control_surfaces", return_value=[]):
+            surface.update_display()
+            self.assertTrue(all(k.parameter is None for k in knobs))
+        self.assertEqual([t.mixer_device.volume.value for t in tracks], values)
+
     @classmethod
     def setUpClass(cls):
         modes = {name: name for name in (
@@ -225,7 +473,8 @@ class SurfaceTests(unittest.TestCase):
         modules = {
             "Live": types.SimpleNamespace(MidiMap=midi),
             "_Framework": types.ModuleType("_Framework"),
-            "_Framework.ControlSurface": types.SimpleNamespace(ControlSurface=FakeControlSurface),
+            "_Framework.ControlSurface": types.SimpleNamespace(
+                ControlSurface=FakeControlSurface, get_control_surfaces=lambda:[]),
             "_Framework.EncoderElement": types.SimpleNamespace(EncoderElement=FakeEncoder),
             "_Framework.ButtonElement": types.SimpleNamespace(ButtonElement=FakeButton),
             "_Framework.InputControlElement": types.SimpleNamespace(MIDI_CC_TYPE=1, MIDI_NOTE_TYPE=0),
@@ -250,6 +499,7 @@ class SurfaceTests(unittest.TestCase):
         self.config["setup_mode"] = False
         self.config["dump_parameters"] = False
         self.config["encoders"]["track"]["mode"] = "absolute"
+        self.config["encoders"]["global"]["mode"] = "relative_two_complement"
         self.config["tracks"] = {
             "DECK A": [{"mixer": "volume"},
                        {"device": "Auto Filter", "parameter": "Frequency"}] + [None] * 6,
@@ -257,6 +507,8 @@ class SurfaceTests(unittest.TestCase):
                        {"mixer": "volume"}] + [None] * 6,
         }
         self.config["global"] = [{"track": "DECK A", "mixer": "volume"}] + [None] * 7
+        self.config["pads"] = [{"channel": 1, "note": 64, "track": "DECK A"},
+                               {"channel": 1, "note": 65, "track": "BREAKS"}]
 
     def make_surface(self):
         with patch.object(self.surface, "load_config", return_value=self.config):
@@ -289,6 +541,43 @@ class SurfaceTests(unittest.TestCase):
         self.assertTrue(all(k.parameter is None for k in surface._knob_banks["track"]))
         self.assertIsNotNone(surface._knob_banks["global"][0].parameter)
 
+    def test_macros_follow_more_than_eight_tracks_without_resetting_values(self):
+        self.config["tracks"] = {}
+        self.config["track_macros"] = {"rack_name": "PERFORM"}
+        self.song.tracks.extend(track("Extra {}".format(i)) for i in range(10))
+        parameters = []
+        for index, t in enumerate(self.song.tracks):
+            r = rack()
+            t.devices.append(r)
+            for i, p in enumerate(r.parameters[1:9]):
+                p._value = (index * 8 + i) / 127.0  # existing, independently edited Live state
+                parameters.append(p)
+        before = [p.value for p in parameters]
+        surface = self.make_surface()
+        global_parameter = surface._knob_banks["global"][0].parameter
+        for t in self.song.tracks + list(reversed(self.song.tracks)):
+            self.song.view.selected_track = t
+            surface._selection_changed()
+            expected = t.devices[-1].parameters[1:9]
+            self.assertEqual([k.parameter for k in surface._knob_banks["track"]], expected)
+            self.assertTrue(all(k.takeover for k in surface._knob_banks["track"]))
+            self.assertIs(surface._knob_banks["global"][0].parameter, global_parameter)
+        self.assertEqual([p.value for p in parameters], before)
+
+    def test_track_rename_and_new_rack_do_not_require_config_edits(self):
+        self.config["tracks"] = {}
+        self.config["track_macros"] = {"rack_name": "PERFORM"}
+        surface = self.make_surface()
+        t = self.song.tracks[0]
+        t.name = "MY NEW NAME"
+        r = rack()
+        t.devices.append(r)
+        surface._refresh()
+        self.assertIs(surface._knob_banks["track"][0].parameter, r.parameters[1])
+        t.devices.remove(r)
+        surface._refresh()
+        self.assertTrue(all(k.parameter is None for k in surface._knob_banks["track"]))
+
     def test_deleted_device_unmaps_and_new_device_recovers(self):
         surface = self.make_surface()
         knob = surface._knob_banks["track"][1]
@@ -313,6 +602,21 @@ class SurfaceTests(unittest.TestCase):
         surface.receive_midi((0xB9, 23, 127))
         self.assertIn("channel=10 cc=23 value=127", surface.logs[-1])
 
+    def test_mapping_diagnostics_report_native_result_without_writing_values(self):
+        self.config["dump_parameters"] = True
+        surface = self.make_surface()
+        knob = surface._knob_banks["track"][0]
+        knob._is_mapped = False
+        surface.build_midi_map(99)
+        rows = [json.loads(line.split(" MAPPING ", 1)[1]) for line in surface.logs
+                if " MAPPING " in line]
+        row = next(row for row in rows if row["bank"] == "track" and row["knob"] == 1)
+        self.assertFalse(row["mapped"])
+        self.assertEqual(row["cc"], 38)
+        self.assertEqual(row["name"], "Volume")
+        self.assertEqual(row["value"], 0.5)
+        self.assertEqual(self.forward_cc, [])
+
     def test_invalid_configuration_fails_closed(self):
         with patch.object(self.surface, "load_config", side_effect=ConfigurationError("bad CC")):
             surface = self.surface.HybridElectro(self.instance)
@@ -333,6 +637,21 @@ class SurfaceTests(unittest.TestCase):
         pads._select("MISSING", 100)
         self.assertIs(self.song.view.selected_track, self.song.tracks[1])
 
+    def test_pad_resolves_new_ring_position_at_press_time(self):
+        self.config["pad_follow_session"] = {"surface":"Launchpad"}
+        self.config["pads"] = [{"channel":1,"note":64,"track_slot":1}]
+        launchpad = type("Launchpad", (), {})()
+        ring = types.SimpleNamespace(width=lambda:8,track_offset=lambda:0,
+                                     tracks_to_use=lambda:self.song.tracks)
+        launchpad._highlighting_session_component = ring
+        pads = self.make_pads()
+        with patch.object(self.pads, "get_control_surfaces", return_value=[launchpad]):
+            ring.track_offset = lambda:1
+            pads._buttons[0].listener(0)
+            self.assertIs(self.song.view.selected_track,self.song.tracks[0])
+            pads._buttons[0].listener(100)
+            self.assertIs(self.song.view.selected_track,self.song.tracks[1])
+
     def test_pad_setup_logs_notes_without_selecting(self):
         self.config["setup_mode"] = True
         pads = self.make_pads()
@@ -347,6 +666,22 @@ class SurfaceTests(unittest.TestCase):
 
 
 class ToolsTests(unittest.TestCase):
+    def test_set_cleanup_preserves_values_and_unrelated_assignments(self):
+        root = ET.fromstring('''<LiveSet><Param><Manual Value="0.8"/>
+            <KeyMidi><IsNote Value="false"/><Channel Value="0"/>
+            <NoteOrController Value="38"/></KeyMidi></Param>
+            <Other><Manual Value="0.3"/><KeyMidi><IsNote Value="false"/>
+            <Channel Value="0"/><NoteOrController Value="5"/></KeyMidi></Other>
+            <OtherChannel><KeyMidi><IsNote Value="false"/><Channel Value="1"/>
+            <NoteOrController Value="38"/></KeyMidi></OtherChannel></LiveSet>''')
+        values = [n.get("Value") for n in root.iter("Manual")]
+        removed = clean_midi_mappings(root, config())
+        self.assertEqual(len(removed), 1)
+        self.assertIsNone(root.find("Param/KeyMidi"))
+        self.assertIsNotNone(root.find("Other/KeyMidi"))
+        self.assertIsNotNone(root.find("OtherChannel/KeyMidi"))
+        self.assertEqual(values, [n.get("Value") for n in root.iter("Manual")])
+
     def test_installer_backs_up_and_preserves_user_config(self):
         with tempfile.TemporaryDirectory() as directory:
             with patch("builtins.print"):

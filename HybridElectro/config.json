@@ -1,56 +1,101 @@
 {
-  "_note": "MIDI numbers and parameter names below are EXAMPLES, not a measured SMC-PAD preset. Leave setup_mode true until calibrated.",
+  "_note": "SMC-PAD channel 1: CC30-37 control volumes of the eight tracks in the Launchpad ring; CC38-45 control PERFORM macros on the selected track. Binding never resets parameter values.",
   "version": 1,
-  "setup_mode": true,
-  "dump_parameters": true,
+  "setup_mode": false,
+  "dump_parameters": false,
   "encoders": {
     "track": {
       "channel": 1,
-      "cc": [16, 17, 18, 19, 20, 21, 22, 23],
-      "mode": "relative_two_complement",
+      "cc": [
+        38,
+        39,
+        40,
+        41,
+        42,
+        43,
+        44,
+        45
+      ],
+      "mode": "absolute",
       "sensitivity": 1.0
     },
     "global": {
       "channel": 1,
-      "cc": [24, 25, 26, 27, 28, 29, 30, 31],
-      "mode": "relative_two_complement",
+      "cc": [
+        30,
+        31,
+        32,
+        33,
+        34,
+        35,
+        36,
+        37
+      ],
+      "mode": "absolute",
       "sensitivity": 1.0
     }
   },
-  "tracks": {
-    "DECK A": [
-      {"mixer": "volume"},
-      {"device": "EQ Three", "parameter": "GainLo"},
-      {"device": "EQ Three", "parameter": "GainMid"},
-      {"device": "EQ Three", "parameter": "GainHi"},
-      {"device": "Auto Filter", "parameter": "Frequency"},
-      {"device": "Auto Filter", "parameter": "Resonance"},
-      {"send": 1},
-      {"send": 2}
-    ],
-    "BREAKS": [
-      {"device": "Beat Repeat", "parameter": "Grid"},
-      {"device": "Beat Repeat", "parameter": "Variation"},
-      {"device": "Auto Filter", "parameter": "Frequency"},
-      {"device": "Auto Filter", "parameter": "Resonance"},
-      {"device": "Saturator", "parameter": "Drive"},
-      {"mixer": "volume"},
-      {"send": 1},
-      {"send": 2}
-    ]
-  },
+  "tracks": {},
   "global": [
-    {"track": "DECK A", "mixer": "volume"},
-    {"track": "DECK B", "mixer": "volume"},
-    {"track": "BREAKS", "mixer": "volume"},
-    {"track": "VOCALS", "mixer": "volume"},
-    {"track": "@return:1", "mixer": "volume"},
-    {"track": "@return:2", "mixer": "volume"},
-    {"track": "@master", "mixer": "volume"},
-    {"track": "@master", "mixer": "crossfader"}
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null
   ],
   "pads": [
-    {"channel": 10, "note": 40, "track": "DECK A"},
-    {"channel": 10, "note": 41, "track": "BREAKS"}
-  ]
+    {
+      "channel": 1,
+      "note": 64,
+      "track_slot": 1
+    },
+    {
+      "channel": 1,
+      "note": 65,
+      "track_slot": 2
+    },
+    {
+      "channel": 1,
+      "note": 66,
+      "track_slot": 3
+    },
+    {
+      "channel": 1,
+      "note": 67,
+      "track_slot": 4
+    },
+    {
+      "channel": 1,
+      "note": 60,
+      "track_slot": 5
+    },
+    {
+      "channel": 1,
+      "note": 61,
+      "track_slot": 6
+    },
+    {
+      "channel": 1,
+      "note": 62,
+      "track_slot": 7
+    },
+    {
+      "channel": 1,
+      "note": 63,
+      "track_slot": 8
+    }
+  ],
+  "track_macros": {
+    "rack_name": "PERFORM"
+  },
+  "pad_follow_session": {
+    "surface": "Launchpad"
+  },
+  "volume_follow_session": {
+    "surface": "Launchpad",
+    "max_db": 0
+  }
 }
