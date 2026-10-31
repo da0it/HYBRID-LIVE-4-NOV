@@ -1,0 +1,56 @@
+{
+  "_note": "MIDI numbers and parameter names below are EXAMPLES, not a measured SMC-PAD preset. Leave setup_mode true until calibrated.",
+  "version": 1,
+  "setup_mode": true,
+  "dump_parameters": true,
+  "encoders": {
+    "track": {
+      "channel": 1,
+      "cc": [16, 17, 18, 19, 20, 21, 22, 23],
+      "mode": "relative_two_complement",
+      "sensitivity": 1.0
+    },
+    "global": {
+      "channel": 1,
+      "cc": [24, 25, 26, 27, 28, 29, 30, 31],
+      "mode": "relative_two_complement",
+      "sensitivity": 1.0
+    }
+  },
+  "tracks": {
+    "DECK A": [
+      {"mixer": "volume"},
+      {"device": "EQ Three", "parameter": "GainLo"},
+      {"device": "EQ Three", "parameter": "GainMid"},
+      {"device": "EQ Three", "parameter": "GainHi"},
+      {"device": "Auto Filter", "parameter": "Frequency"},
+      {"device": "Auto Filter", "parameter": "Resonance"},
+      {"send": 1},
+      {"send": 2}
+    ],
+    "BREAKS": [
+      {"device": "Beat Repeat", "parameter": "Grid"},
+      {"device": "Beat Repeat", "parameter": "Variation"},
+      {"device": "Auto Filter", "parameter": "Frequency"},
+      {"device": "Auto Filter", "parameter": "Resonance"},
+      {"device": "Saturator", "parameter": "Drive"},
+      {"mixer": "volume"},
+      {"send": 1},
+      {"send": 2}
+    ]
+  },
+  "global": [
+    {"track": "DECK A", "mixer": "volume"},
+    {"track": "DECK B", "mixer": "volume"},
+    {"track": "BREAKS", "mixer": "volume"},
+    {"track": "VOCALS", "mixer": "volume"},
+    {"track": "@return:1", "mixer": "volume"},
+    {"track": "@return:2", "mixer": "volume"},
+    {"track": "@master", "mixer": "volume"},
+    {"track": "@master", "mixer": "crossfader"}
+  ],
+  "pads": [
+    {"channel": 10, "note": 40, "track": "DECK A"},
+    {"channel": 10, "note": 41, "track": "BREAKS"}
+  ]
+}
